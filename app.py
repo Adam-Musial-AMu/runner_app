@@ -1,0 +1,485 @@
+import json
+import re
+from pathlib import Path
+from datetime import timedelta
+
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+
+from pycaret.regression import load_model, predict_model
+
+# Optional integrations
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+try:
+    from langfuse import Langfuse
+except Exception:
+    Langfuse = None
+
+
+# -------------------------
+# App config
+# -------------------------
+st.set_page_config(page_title="Half Marathon Predictor", layout="centered")
+load_dotenv()
+
+ARTIFACTS_5K_DIR = Path("artifacts") / "pre_race_5k"
+ARTIFACTS_10K_DIR = Path("artifacts") / "pre_race_10k"
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def time_to_seconds(text: str):
+    """
+    Parses:
+      - HH:MM:SS
+      - MM:SS
+      - also allows "25 min", "25:10", "0:25:10" style
+    Returns int seconds or None.
+    """
+    if text is None:
+        return None
+    s = str(text).strip().lower()
+
+    # normalize common phrases
+    s = s.replace("minut", "min").replace("min.", "min").replace("minutes", "min").replace("minute", "min")
+    s = s.replace("sekund", "s").replace("sec.", "s").replace("seconds", "s").replace("second", "s")
+    s = s.replace(",", ".").strip()
+
+    # patterns like "25 min 10 s"
+    mm = re.search(r"(\d{1,3})\s*min", s)
+    ss = re.search(r"(\d{1,2})\s*s", s)
+    if mm and not ":" in s:
+        m = int(mm.group(1))
+        sec = int(ss.group(1)) if ss else 0
+        return m * 60 + sec
+
+    # patterns like "1:23:45" or "23:45"
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            parts = [int(p) for p in parts]
+            if len(parts) == 3:
+                h, m, sec = parts
+                return h * 3600 + m * 60 + sec
+            if len(parts) == 2:
+                m, sec = parts
+                return m * 60 + sec
+        except Exception:
+            return None
+
+    # plain integer (assume seconds)
+    if re.fullmatch(r"\d+", s):
+        return int(s)
+
+    return None
+
+
+def seconds_to_hhmmss(sec: float):
+    if sec is None:
+        return ""
+    sec = int(round(float(sec)))
+    return str(timedelta(seconds=sec))
+
+
+def normalize_sex(s: str):
+    if s is None:
+        return None
+    x = str(s).strip().upper()
+    if x in ["MALE", "MAN", "MĘŻCZYZNA", "MEZCZYZNA"]:
+        return "M"
+    if x in ["FEMALE", "WOMAN", "KOBIETA"]:
+        return "K"
+    if x == "F":
+        return "K"
+    if x in ["M", "K"]:
+        return x
+    return None
+
+
+def load_latest_bundle(artifact_dir: Path):
+    latest_path = artifact_dir / "latest.json"
+    if not latest_path.exists():
+        raise FileNotFoundError(f"Missing latest.json: {latest_path}")
+
+    latest = json.loads(latest_path.read_text(encoding="utf-8"))
+
+    model_pkl = artifact_dir / latest["model_pkl"]
+    meta_json = artifact_dir / latest["metadata_json"]
+    schema_json = artifact_dir / latest["schema_json"]
+
+    if not model_pkl.exists():
+        raise FileNotFoundError(f"Missing model file: {model_pkl}")
+    if not meta_json.exists():
+        raise FileNotFoundError(f"Missing metadata file: {meta_json}")
+    if not schema_json.exists():
+        raise FileNotFoundError(f"Missing schema file: {schema_json}")
+
+    schema = json.loads(schema_json.read_text(encoding="utf-8"))
+    metadata = json.loads(meta_json.read_text(encoding="utf-8"))
+
+    # PyCaret load_model expects path WITHOUT ".pkl"
+    model_stem = str(model_pkl.with_suffix(""))
+    model = load_model(model_stem)
+
+    return {
+        "latest": latest,
+        "schema": schema,
+        "metadata": metadata,
+        "model": model,
+        "artifact_dir": artifact_dir,
+        "model_pkl": str(model_pkl),
+        "meta_json": str(meta_json),
+        "schema_json": str(schema_json),
+    }
+
+
+@st.cache_resource
+def get_bundles():
+    b5 = load_latest_bundle(ARTIFACTS_5K_DIR)
+    b10 = None
+    if (ARTIFACTS_10K_DIR / "latest.json").exists():
+        b10 = load_latest_bundle(ARTIFACTS_10K_DIR)
+    return b5, b10
+
+
+def validate_against_schema(data: dict, schema: dict):
+    """
+    Returns: (missing_fields: list[str], errors: list[str])
+    """
+    missing = []
+    errors = []
+
+    features = schema.get("features", {})
+    for field, rules in features.items():
+        if field not in data or data[field] is None or data[field] == "":
+            missing.append(field)
+            continue
+
+        val = data[field]
+        t = rules.get("type")
+
+        if t == "int":
+            if not isinstance(val, int):
+                errors.append(f"{field}: expected int, got {type(val).__name__}")
+                continue
+            if "min" in rules and val < rules["min"]:
+                errors.append(f"{field}: below minimum {rules['min']}")
+            if "max" in rules and val > rules["max"]:
+                errors.append(f"{field}: above maximum {rules['max']}")
+        elif t == "category":
+            allowed = rules.get("allowed")
+            if allowed and val not in allowed:
+                errors.append(f"{field}: invalid value '{val}', allowed: {allowed}")
+
+    return missing, errors
+
+
+def get_default_year_from_schema(schema: dict):
+    yrs = schema.get("features", {}).get("Rok", {}).get("allowed", [])
+    if isinstance(yrs, list) and len(yrs) > 0:
+        return max(yrs)
+    return 2024
+
+
+def regex_fallback_extract(text: str):
+    """
+    Very simple extraction:
+      - age: "mam 35 lat" / "35yo"
+      - sex: M/K words
+      - 5k time: "5 km 24:10" / "5k 24:10" / "na 5 km 24 min"
+      - 10k time: "10 km 50:00" / "10k 50:00"
+    """
+    t = (text or "").lower()
+
+    out = {}
+
+    # age
+    m_age = re.search(r"(\d{1,3})\s*(lat|lata|years|yo|y\.o\.)", t)
+    if m_age:
+        out["Wiek"] = int(m_age.group(1))
+
+    # sex
+    if re.search(r"\b(m|mezczyzna|mężczyzna|facet|male|man)\b", t):
+        out["Płeć"] = "M"
+    if re.search(r"\b(k|kobieta|female|woman)\b", t):
+        out["Płeć"] = "K"
+
+    # 5k time
+    m_5k = re.search(r"(5\s*(km|k))[^0-9]*(\d{1,2}:\d{2}(:\d{2})?|\d{1,3}\s*min(\s*\d{1,2}\s*s)?)", t)
+    if m_5k:
+        out["Czas_5km_sek"] = time_to_seconds(m_5k.group(3))
+
+    # 10k time
+    m_10k = re.search(r"(10\s*(km|k))[^0-9]*(\d{1,2}:\d{2}(:\d{2})?|\d{1,3}\s*min(\s*\d{1,2}\s*s)?)", t)
+    if m_10k:
+        out["Czas_10km_sek"] = time_to_seconds(m_10k.group(3))
+
+    return out
+
+
+def llm_extract_to_dict(text: str, schema: dict, mode_hint: str):
+    """
+    Uses OpenAI (if configured) to extract fields into strict JSON.
+    Fallback: regex.
+    """
+    # If no OpenAI client available, fallback
+    if OpenAI is None:
+        return regex_fallback_extract(text), {"method": "regex", "ok": True, "error": None}
+
+    api_key = None
+    try:
+        import os
+        api_key = os.getenv("OPENAI_API_KEY")
+    except Exception:
+        api_key = None
+
+    if not api_key:
+        return regex_fallback_extract(text), {"method": "regex", "ok": True, "error": "OPENAI_API_KEY not set"}
+
+    client = OpenAI()
+
+    # Build target keys from schema
+    keys = list(schema.get("features", {}).keys())
+
+    system = (
+        "You are a data extraction engine. Extract required fields from user text.\n"
+        "Return ONLY valid JSON (no markdown, no commentary). If a field is missing, set it to null.\n"
+        "Time fields must be converted to integer seconds.\n"
+        "Sex must be 'M' or 'K'.\n"
+        "Do not hallucinate values.\n"
+    )
+
+    user = f"""
+MODE_HINT: {mode_hint}
+TARGET_FIELDS: {keys}
+
+User text:
+{text}
+"""
+
+    # Langfuse (optional)
+    lf = None
+    try:
+        import os
+        lf_pk = os.getenv("LANGFUSE_PUBLIC_KEY")
+        lf_sk = os.getenv("LANGFUSE_SECRET_KEY")
+        lf_host = os.getenv("LANGFUSE_HOST")  # optional
+        if Langfuse and lf_pk and lf_sk:
+            lf = Langfuse(public_key=lf_pk, secret_key=lf_sk, host=lf_host) if lf_host else Langfuse(public_key=lf_pk, secret_key=lf_sk)
+    except Exception:
+        lf = None
+
+    trace = None
+    span = None
+    if lf:
+        trace = lf.trace(name="hm_input_extraction", metadata={"mode_hint": mode_hint})
+        span = trace.span(name="openai_extract")
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",  # możesz zmienić, ale ten jest szybki i tani
+            temperature=0,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        content = resp.choices[0].message.content.strip()
+
+        if span:
+            span.event(name="llm_response", metadata={"content": content})
+
+        extracted = json.loads(content)
+
+        # Normalize keys: keep only schema keys
+        extracted = {k: extracted.get(k, None) for k in keys}
+
+        # Post-normalization
+        if "Płeć" in extracted:
+            extracted["Płeć"] = normalize_sex(extracted["Płeć"])
+
+        for k in ["Czas_5km_sek", "Czas_10km_sek"]:
+            if k in extracted and extracted[k] is not None and not isinstance(extracted[k], int):
+                # allow string time from LLM, parse
+                extracted[k] = time_to_seconds(str(extracted[k]))
+
+        if "Wiek" in extracted and extracted["Wiek"] is not None and not isinstance(extracted["Wiek"], int):
+            try:
+                extracted["Wiek"] = int(float(extracted["Wiek"]))
+            except Exception:
+                extracted["Wiek"] = None
+
+        if span:
+            span.end(status="success")
+
+        return extracted, {"method": "openai", "ok": True, "error": None}
+
+    except Exception as e:
+        if span:
+            span.event(name="llm_error", metadata={"error": str(e)})
+            span.end(status="error")
+        # fallback
+        fallback = regex_fallback_extract(text)
+        return fallback, {"method": "regex", "ok": False, "error": str(e)}
+
+
+def prepare_features_for_model(extracted: dict, schema: dict):
+    """
+    Builds a 1-row DataFrame with exactly the features required by schema.
+    Adds default Rok if missing.
+    """
+    features = schema.get("features", {})
+    row = {}
+
+    for k in features.keys():
+        row[k] = extracted.get(k, None)
+
+    # default year if missing
+    if "Rok" in row and (row["Rok"] is None or row["Rok"] == ""):
+        row["Rok"] = get_default_year_from_schema(schema)
+
+    return pd.DataFrame([row])
+
+
+# -------------------------
+# UI
+# -------------------------
+st.title("🏃 Predykcja czasu półmaratonu (PRE_RACE)")
+st.caption("Wpisz jednym tekstem: płeć, wiek oraz czas na 5 km (opcjonalnie 10 km). Model dobierze wariant automatycznie.")
+
+b5, b10 = get_bundles()
+
+with st.sidebar:
+    st.header("Model")
+    mode = st.selectbox(
+        "Tryb użycia",
+        ["AUTO (10k jeśli dostępne)", "WYMUŚ PRE_RACE_5K", "WYMUŚ PRE_RACE_10K"],
+        index=0
+    )
+
+    st.divider()
+    st.subheader("Info o modelu (z metadata)")
+    st.write("PRE_RACE_5K MAE (test 2024):", round(b5["metadata"]["metrics"].get("test2024_mae_sec", b5["metadata"]["metrics"].get("test_mae_sec", 0)) / 60, 2), "min")
+
+    if b10:
+        st.write("PRE_RACE_10K MAE (test 2024):", round(b10["metadata"]["metrics"].get("test_mae_sec", 0) / 60, 2), "min")
+    else:
+        st.info("Brak artefaktów PRE_RACE_10K (folder artifacts/pre_race_10k).")
+
+    st.divider()
+    st.subheader("Ustawienia")
+    use_llm = st.checkbox("Użyj LLM do ekstrakcji (OpenAI)", value=True)
+    show_debug = st.checkbox("Pokaż debug (parsed JSON, walidacja)", value=True)
+
+
+user_text = st.text_area(
+    "Wejście (jedno pole tekstowe)",
+    height=140,
+    placeholder="Np. Cześć, mam 35 lat, jestem mężczyzną. 5 km robię w 24:30. 10 km w 50:10."
+)
+
+col1, col2 = st.columns([1, 1])
+with col1:
+    btn_extract = st.button("🔍 Wyciągnij dane", use_container_width=True)
+with col2:
+    btn_predict = st.button("🎯 Policz predykcję", use_container_width=True)
+
+if btn_extract or btn_predict:
+    if not user_text.strip():
+        st.warning("Wpisz tekst z danymi (płeć, wiek, czas 5 km).")
+        st.stop()
+
+    # Choose initial schema based on mode hint
+    if mode == "WYMUŚ PRE_RACE_10K":
+        if not b10:
+            st.error("Nie masz artefaktów PRE_RACE_10K. Wytrenuj model 10K albo wybierz 5K/AUTO.")
+            st.stop()
+        schema_hint = b10["schema"]
+        mode_hint = "pre_race_10k"
+    else:
+        schema_hint = b5["schema"]
+        mode_hint = "pre_race_5k"
+
+    # Extraction
+    if use_llm:
+        extracted, meta = llm_extract_to_dict(user_text, schema_hint, mode_hint=mode_hint)
+    else:
+        extracted = regex_fallback_extract(user_text)
+        meta = {"method": "regex", "ok": True, "error": None}
+
+    # Auto mode: if 10k exists and extracted has 10k -> use 10k schema
+    selected_bundle = b5
+    selected_name = "PRE_RACE_5K"
+
+    if mode == "WYMUŚ PRE_RACE_5K":
+        selected_bundle = b5
+        selected_name = "PRE_RACE_5K"
+    elif mode == "WYMUŚ PRE_RACE_10K":
+        selected_bundle = b10
+        selected_name = "PRE_RACE_10K"
+    else:
+        # AUTO
+        if b10 and extracted.get("Czas_10km_sek") is not None:
+            selected_bundle = b10
+            selected_name = "PRE_RACE_10K"
+        else:
+            selected_bundle = b5
+            selected_name = "PRE_RACE_5K"
+
+    schema = selected_bundle["schema"]
+    metadata = selected_bundle["metadata"]
+    model = selected_bundle["model"]
+
+    # If we extracted using 5k schema but AUTO selects 10k, re-validate against 10k schema
+    # and keep extracted dict (may miss 10k -> will be asked)
+    features_df = prepare_features_for_model(extracted, schema)
+
+    missing, errors = validate_against_schema(features_df.iloc[0].to_dict(), schema)
+
+    # Output extraction info
+    st.subheader("✅ Ekstrakcja danych")
+    st.write("Metoda:", meta["method"], "| OK:", meta["ok"])
+    if meta.get("error"):
+        st.caption(f"LLM fallback reason: {meta['error']}")
+
+    if show_debug:
+        st.code(json.dumps(features_df.iloc[0].to_dict(), indent=2, ensure_ascii=False), language="json")
+
+    if errors:
+        st.error("Błędy walidacji danych:")
+        for e in errors:
+            st.write("•", e)
+
+    if missing:
+        st.warning("Brakuje danych wymaganych do predykcji:")
+        st.write(", ".join(missing))
+        st.info("Uzupełnij dane w tekście i spróbuj ponownie.")
+        if btn_predict:
+            st.stop()
+
+    if btn_predict:
+        # Predict
+        pred = predict_model(model, data=features_df)
+        y_hat = float(pred["prediction_label"].iloc[0])
+
+        st.subheader(f"🎯 Wynik – {selected_name}")
+        st.metric("Szacowany czas półmaratonu", seconds_to_hhmmss(y_hat))
+
+        # Optional: show uncertainty from metadata
+        mae_sec = metadata.get("metrics", {}).get("test2024_mae_sec", metadata.get("metrics", {}).get("test_mae_sec"))
+        if mae_sec:
+            st.caption(f"Średni błąd (MAE) na teście 2024: ±{mae_sec/60:.2f} min")
+
+        # Basic pace estimate
+        pace_min_per_km = (y_hat / 60) / 21.0975
+        st.write(f"Szacowane tempo: **{pace_min_per_km:.2f} min/km**")
+
+        if show_debug:
+            st.subheader("Debug: predykcja")
+            st.dataframe(pred)
