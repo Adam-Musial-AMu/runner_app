@@ -9,6 +9,11 @@ from dotenv import load_dotenv
 
 from pycaret.regression import load_model, predict_model
 
+# Pandera validation
+import pandera as pa
+from pandera import Column, Check, DataFrameSchema
+
+
 # Optional integrations
 try:
     from openai import OpenAI
@@ -16,9 +21,10 @@ except Exception:
     OpenAI = None
 
 try:
-    from langfuse import Langfuse
+    # Langfuse decorator
+    from langfuse import observe
 except Exception:
-    Langfuse = None
+    observe = None
 
 
 # -------------------------
@@ -54,7 +60,7 @@ def time_to_seconds(text: str):
     # patterns like "25 min 10 s"
     mm = re.search(r"(\d{1,3})\s*min", s)
     ss = re.search(r"(\d{1,2})\s*s", s)
-    if mm and not ":" in s:
+    if mm and ":" not in s:
         m = int(mm.group(1))
         sec = int(ss.group(1)) if ss else 0
         return m * 60 + sec
@@ -91,7 +97,7 @@ def normalize_sex(s: str):
     if s is None:
         return None
     x = str(s).strip().upper()
-    if x in ["MALE", "MAN", "MĘŻCZYZNA", "MEZCZYZNA"]:
+    if x in ["MALE", "MAN", "MĘŻCZYZNA", "MEZCZYZNA", "FACET"]:
         return "M"
     if x in ["FEMALE", "WOMAN", "KOBIETA"]:
         return "K"
@@ -148,43 +154,33 @@ def get_bundles():
     return b5, b10
 
 
-def validate_against_schema(data: dict, schema: dict):
-    """
-    Returns: (missing_fields: list[str], errors: list[str])
-    """
-    missing = []
-    errors = []
-
-    features = schema.get("features", {})
-    for field, rules in features.items():
-        if field not in data or data[field] is None or data[field] == "":
-            missing.append(field)
-            continue
-
-        val = data[field]
-        t = rules.get("type")
-
-        if t == "int":
-            if not isinstance(val, int):
-                errors.append(f"{field}: expected int, got {type(val).__name__}")
-                continue
-            if "min" in rules and val < rules["min"]:
-                errors.append(f"{field}: below minimum {rules['min']}")
-            if "max" in rules and val > rules["max"]:
-                errors.append(f"{field}: above maximum {rules['max']}")
-        elif t == "category":
-            allowed = rules.get("allowed")
-            if allowed and val not in allowed:
-                errors.append(f"{field}: invalid value '{val}', allowed: {allowed}")
-
-    return missing, errors
-
-
 def get_default_year_from_schema(schema: dict):
     yrs = schema.get("features", {}).get("Rok", {}).get("allowed", [])
     if isinstance(yrs, list) and len(yrs) > 0:
-        return max(yrs)
+        try:
+            return max(yrs)
+        except Exception:
+            return 2024
     return 2024
+
+
+def schema_union_keys(schema_a: dict, schema_b: dict | None):
+    keys = set(schema_a.get("features", {}).keys())
+    if schema_b:
+        keys |= set(schema_b.get("features", {}).keys())
+    # typowo wymagane w Twoim przypadku:
+    keys |= {"Wiek", "Płeć", "Czas_5km_sek", "Czas_10km_sek", "Rok"}
+    return sorted(keys)
+
+
+def text_mentions_5k(text: str) -> bool:
+    t = (text or "").lower()
+    return re.search(r"\b5\s*(km|k)\b", t) is not None
+
+
+def text_mentions_10k(text: str) -> bool:
+    t = (text or "").lower()
+    return re.search(r"\b10\s*(km|k)\b", t) is not None
 
 
 def regex_fallback_extract(text: str):
@@ -196,7 +192,6 @@ def regex_fallback_extract(text: str):
       - 10k time: "10 km 50:00" / "10k 50:00"
     """
     t = (text or "").lower()
-
     out = {}
 
     # age
@@ -211,47 +206,84 @@ def regex_fallback_extract(text: str):
         out["Płeć"] = "K"
 
     # 5k time
-    m_5k = re.search(r"(5\s*(km|k))[^0-9]*(\d{1,2}:\d{2}(:\d{2})?|\d{1,3}\s*min(\s*\d{1,2}\s*s)?)", t)
+    m_5k = re.search(
+        r"(5\s*(km|k))[^0-9]*(\d{1,2}:\d{2}(:\d{2})?|\d{1,3}\s*min(\s*\d{1,2}\s*s)?)",
+        t
+    )
     if m_5k:
         out["Czas_5km_sek"] = time_to_seconds(m_5k.group(3))
 
     # 10k time
-    m_10k = re.search(r"(10\s*(km|k))[^0-9]*(\d{1,2}:\d{2}(:\d{2})?|\d{1,3}\s*min(\s*\d{1,2}\s*s)?)", t)
+    m_10k = re.search(
+        r"(10\s*(km|k))[^0-9]*(\d{1,2}:\d{2}(:\d{2})?|\d{1,3}\s*min(\s*\d{1,2}\s*s)?)",
+        t
+    )
     if m_10k:
         out["Czas_10km_sek"] = time_to_seconds(m_10k.group(3))
 
     return out
 
 
-def llm_extract_to_dict(text: str, schema: dict, mode_hint: str):
+def post_normalize_extracted(extracted: dict, user_text: str):
+    """
+    Twarda ochrona przed 'dopowiadaniem':
+    - jeśli tekst NIE wspomina o 5k, a extracted zawiera Czas_5km_sek -> wyzeruj (None)
+    - jeśli tekst NIE wspomina o 10k, a extracted zawiera Czas_10km_sek -> wyzeruj (None)
+    """
+    if "Płeć" in extracted:
+        extracted["Płeć"] = normalize_sex(extracted.get("Płeć"))
+
+    # time fields parsing if strings
+    for k in ["Czas_5km_sek", "Czas_10km_sek"]:
+        if k in extracted and extracted[k] is not None and not isinstance(extracted[k], int):
+            extracted[k] = time_to_seconds(str(extracted[k]))
+
+    # age parsing if numeric-like
+    if "Wiek" in extracted and extracted["Wiek"] is not None and not isinstance(extracted["Wiek"], int):
+        try:
+            extracted["Wiek"] = int(float(extracted["Wiek"]))
+        except Exception:
+            extracted["Wiek"] = None
+
+    # anti-hallucination / anti-inference
+    if not text_mentions_5k(user_text):
+        extracted["Czas_5km_sek"] = None
+    if not text_mentions_10k(user_text):
+        extracted["Czas_10km_sek"] = None
+
+    return extracted
+
+
+def llm_extract_to_dict(text: str, keys: list[str], mode_hint: str):
     """
     Uses OpenAI (if configured) to extract fields into strict JSON.
     Fallback: regex.
     """
     # If no OpenAI client available, fallback
     if OpenAI is None:
-        return regex_fallback_extract(text), {"method": "regex", "ok": True, "error": None}
+        extracted = regex_fallback_extract(text)
+        extracted = {k: extracted.get(k, None) for k in keys}
+        extracted = post_normalize_extracted(extracted, text)
+        return extracted, {"method": "regex", "ok": True, "error": None}
 
-    api_key = None
-    try:
-        import os
-        api_key = os.getenv("OPENAI_API_KEY")
-    except Exception:
-        api_key = None
-
+    import os
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        return regex_fallback_extract(text), {"method": "regex", "ok": True, "error": "OPENAI_API_KEY not set"}
+        extracted = regex_fallback_extract(text)
+        extracted = {k: extracted.get(k, None) for k in keys}
+        extracted = post_normalize_extracted(extracted, text)
+        return extracted, {"method": "regex", "ok": True, "error": "OPENAI_API_KEY not set"}
 
     client = OpenAI()
 
-    # Build target keys from schema
-    keys = list(schema.get("features", {}).keys())
-
     system = (
-        "You are a data extraction engine. Extract required fields from user text.\n"
-        "Return ONLY valid JSON (no markdown, no commentary). If a field is missing, set it to null.\n"
+        "You are a strict data extraction engine.\n"
+        "Return ONLY valid JSON (no markdown, no commentary).\n"
+        "If a field is missing in the user text, set it to null.\n"
         "Time fields must be converted to integer seconds.\n"
         "Sex must be 'M' or 'K'.\n"
+        "CRITICAL RULE: Do NOT infer 5k from 10k or 10k from 5k. "
+        "Only extract a time if the corresponding distance (5k/5 km or 10k/10 km) is explicitly mentioned.\n"
         "Do not hallucinate values.\n"
     )
 
@@ -263,27 +295,9 @@ User text:
 {text}
 """
 
-    # Langfuse (optional)
-    lf = None
-    try:
-        import os
-        lf_pk = os.getenv("LANGFUSE_PUBLIC_KEY")
-        lf_sk = os.getenv("LANGFUSE_SECRET_KEY")
-        lf_host = os.getenv("LANGFUSE_HOST")  # optional
-        if Langfuse and lf_pk and lf_sk:
-            lf = Langfuse(public_key=lf_pk, secret_key=lf_sk, host=lf_host) if lf_host else Langfuse(public_key=lf_pk, secret_key=lf_sk)
-    except Exception:
-        lf = None
-
-    trace = None
-    span = None
-    if lf:
-        trace = lf.trace(name="hm_input_extraction", metadata={"mode_hint": mode_hint})
-        span = trace.span(name="openai_extract")
-
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",  # możesz zmienić, ale ten jest szybki i tani
+            model="gpt-4o-mini",
             temperature=0,
             messages=[
                 {"role": "system", "content": system},
@@ -291,42 +305,24 @@ User text:
             ],
         )
         content = resp.choices[0].message.content.strip()
-
-        if span:
-            span.event(name="llm_response", metadata={"content": content})
-
         extracted = json.loads(content)
 
-        # Normalize keys: keep only schema keys
+        # Normalize keys: keep only requested keys
         extracted = {k: extracted.get(k, None) for k in keys}
-
-        # Post-normalization
-        if "Płeć" in extracted:
-            extracted["Płeć"] = normalize_sex(extracted["Płeć"])
-
-        for k in ["Czas_5km_sek", "Czas_10km_sek"]:
-            if k in extracted and extracted[k] is not None and not isinstance(extracted[k], int):
-                # allow string time from LLM, parse
-                extracted[k] = time_to_seconds(str(extracted[k]))
-
-        if "Wiek" in extracted and extracted["Wiek"] is not None and not isinstance(extracted["Wiek"], int):
-            try:
-                extracted["Wiek"] = int(float(extracted["Wiek"]))
-            except Exception:
-                extracted["Wiek"] = None
-
-        if span:
-            span.end(status="success")
+        extracted = post_normalize_extracted(extracted, text)
 
         return extracted, {"method": "openai", "ok": True, "error": None}
 
     except Exception as e:
-        if span:
-            span.event(name="llm_error", metadata={"error": str(e)})
-            span.end(status="error")
-        # fallback
         fallback = regex_fallback_extract(text)
+        fallback = {k: fallback.get(k, None) for k in keys}
+        fallback = post_normalize_extracted(fallback, text)
         return fallback, {"method": "regex", "ok": False, "error": str(e)}
+
+
+# Langfuse wrapper via @observe (if available)
+if observe is not None:
+    llm_extract_to_dict = observe(name="hm_input_extraction")(llm_extract_to_dict)
 
 
 def prepare_features_for_model(extracted: dict, schema: dict):
@@ -347,6 +343,65 @@ def prepare_features_for_model(extracted: dict, schema: dict):
     return pd.DataFrame([row])
 
 
+def build_pandera_schema_from_artifact(schema_json: dict) -> pa.DataFrameSchema:
+    """
+    Mapuje Twój schema.json -> Pandera DataFrameSchema.
+    UWAGA: nullable=True dla wszystkich pól (bo 'required' wymuszamy osobno).
+    """
+    features = schema_json.get("features", {})
+    columns = {}
+
+    for field, rules in features.items():
+        t = rules.get("type")
+
+        # Domyślnie: nullable (wymagalność sprawdzamy osobno)
+        nullable = True
+
+        if t == "int":
+            checks = []
+            if "min" in rules:
+                checks.append(Check.ge(rules["min"]))
+            if "max" in rules:
+                checks.append(Check.le(rules["max"]))
+            columns[field] = Column(int, checks=checks, nullable=nullable, coerce=True)
+
+        elif t == "category":
+            allowed = rules.get("allowed")
+            checks = []
+            if allowed:
+                checks.append(Check.isin(allowed))
+            # kategorie zostawiamy jako object/str
+            columns[field] = Column(object, checks=checks, nullable=nullable, coerce=True)
+
+        else:
+            # fallback: pozwól, ale nie waliduj restrykcyjnie typów
+            columns[field] = Column(object, nullable=nullable, coerce=False)
+
+    return DataFrameSchema(columns, coerce=True, strict=False)
+
+
+def required_fields_for_run(selected_name: str, schema: dict):
+    """
+    Zasada:
+      - zawsze wymagane: Wiek, Płeć, Czas_5km_sek
+      - dla modelu 10K dodatkowo wymagamy Czas_10km_sek (jeśli to uruchamiamy)
+    """
+    req = ["Wiek", "Płeć", "Czas_5km_sek"]
+    if selected_name == "PRE_RACE_10K":
+        # jeśli schema ma 10k, to wymagamy
+        if "Czas_10km_sek" in schema.get("features", {}):
+            req.append("Czas_10km_sek")
+    return req
+
+
+def find_missing_required(row: dict, required: list[str]) -> list[str]:
+    missing = []
+    for k in required:
+        if k not in row or row[k] is None or row[k] == "":
+            missing.append(k)
+    return missing
+
+
 # -------------------------
 # UI
 # -------------------------
@@ -359,16 +414,27 @@ with st.sidebar:
     st.header("Model")
     mode = st.selectbox(
         "Tryb użycia",
-        ["AUTO (10k jeśli dostępne)", "WYMUŚ PRE_RACE_5K", "WYMUŚ PRE_RACE_10K"],
+        ["AUTO (10k jeśli dostępne i podane)", "WYMUŚ PRE_RACE_5K", "WYMUŚ PRE_RACE_10K"],
         index=0
     )
 
     st.divider()
     st.subheader("Info o modelu (z metadata)")
-    st.write("PRE_RACE_5K MAE (test 2024):", round(b5["metadata"]["metrics"].get("test2024_mae_sec", b5["metadata"]["metrics"].get("test_mae_sec", 0)) / 60, 2), "min")
+    st.write(
+        "PRE_RACE_5K MAE (test 2024):",
+        round(
+            b5["metadata"]["metrics"].get("test2024_mae_sec", b5["metadata"]["metrics"].get("test_mae_sec", 0)) / 60,
+            2
+        ),
+        "min"
+    )
 
     if b10:
-        st.write("PRE_RACE_10K MAE (test 2024):", round(b10["metadata"]["metrics"].get("test_mae_sec", 0) / 60, 2), "min")
+        st.write(
+            "PRE_RACE_10K MAE (test 2024):",
+            round(b10["metadata"]["metrics"].get("test2024_mae_sec", b10["metadata"]["metrics"].get("test_mae_sec", 0)) / 60, 2),
+            "min"
+        )
     else:
         st.info("Brak artefaktów PRE_RACE_10K (folder artifacts/pre_race_10k).")
 
@@ -390,57 +456,80 @@ with col1:
 with col2:
     btn_predict = st.button("🎯 Policz predykcję", use_container_width=True)
 
+
+def choose_bundle_auto(extracted: dict, b5: dict, b10: dict | None):
+    """
+    AUTO: wybierz 10K TYLKO gdy:
+      - masz artefakty 10K
+      - user podał 10k
+      - user podał 5k (bo 5k jest zawsze wymagane)
+    """
+    has_5k = extracted.get("Czas_5km_sek") is not None
+    has_10k = extracted.get("Czas_10km_sek") is not None
+
+    if b10 and has_10k and has_5k:
+        return b10, "PRE_RACE_10K"
+    return b5, "PRE_RACE_5K"
+
+
+@observe(name="hm_predict") if observe is not None else (lambda f: f)
+def run_prediction(model, features_df: pd.DataFrame) -> float:
+    pred = predict_model(model, data=features_df)
+    return float(pred["prediction_label"].iloc[0])
+
+
 if btn_extract or btn_predict:
     if not user_text.strip():
         st.warning("Wpisz tekst z danymi (płeć, wiek, czas 5 km).")
         st.stop()
 
-    # Choose initial schema based on mode hint
+    # --- kluczowa poprawka: ekstrakcja na superset kluczy (5k + 10k) ---
+    keys = schema_union_keys(b5["schema"], b10["schema"] if b10 else None)
+
+    # Extraction
+    if use_llm:
+        extracted, meta = llm_extract_to_dict(user_text, keys, mode_hint="pre_race_auto")
+    else:
+        extracted = regex_fallback_extract(user_text)
+        extracted = {k: extracted.get(k, None) for k in keys}
+        extracted = post_normalize_extracted(extracted, user_text)
+        meta = {"method": "regex", "ok": True, "error": None}
+
+    # --- wybór modelu ---
     if mode == "WYMUŚ PRE_RACE_10K":
         if not b10:
             st.error("Nie masz artefaktów PRE_RACE_10K. Wytrenuj model 10K albo wybierz 5K/AUTO.")
             st.stop()
-        schema_hint = b10["schema"]
-        mode_hint = "pre_race_10k"
-    else:
-        schema_hint = b5["schema"]
-        mode_hint = "pre_race_5k"
+        selected_bundle, selected_name = b10, "PRE_RACE_10K"
 
-    # Extraction
-    if use_llm:
-        extracted, meta = llm_extract_to_dict(user_text, schema_hint, mode_hint=mode_hint)
-    else:
-        extracted = regex_fallback_extract(user_text)
-        meta = {"method": "regex", "ok": True, "error": None}
+    elif mode == "WYMUŚ PRE_RACE_5K":
+        selected_bundle, selected_name = b5, "PRE_RACE_5K"
 
-    # Auto mode: if 10k exists and extracted has 10k -> use 10k schema
-    selected_bundle = b5
-    selected_name = "PRE_RACE_5K"
-
-    if mode == "WYMUŚ PRE_RACE_5K":
-        selected_bundle = b5
-        selected_name = "PRE_RACE_5K"
-    elif mode == "WYMUŚ PRE_RACE_10K":
-        selected_bundle = b10
-        selected_name = "PRE_RACE_10K"
     else:
-        # AUTO
-        if b10 and extracted.get("Czas_10km_sek") is not None:
-            selected_bundle = b10
-            selected_name = "PRE_RACE_10K"
-        else:
-            selected_bundle = b5
-            selected_name = "PRE_RACE_5K"
+        # AUTO (naprawione: gdy są oba czasy -> wybierz 10K)
+        selected_bundle, selected_name = choose_bundle_auto(extracted, b5, b10)
 
     schema = selected_bundle["schema"]
     metadata = selected_bundle["metadata"]
     model = selected_bundle["model"]
 
-    # If we extracted using 5k schema but AUTO selects 10k, re-validate against 10k schema
-    # and keep extracted dict (may miss 10k -> will be asked)
+    # Build DF for chosen model schema
     features_df = prepare_features_for_model(extracted, schema)
 
-    missing, errors = validate_against_schema(features_df.iloc[0].to_dict(), schema)
+    # Pandera validation (typy / zakresy / allowed)
+    p_schema = build_pandera_schema_from_artifact(schema)
+
+    try:
+        validated_df = p_schema.validate(features_df, lazy=True)
+    except pa.errors.SchemaErrors as e:
+        st.error("Błędy walidacji danych:")
+        st.dataframe(e.failure_cases)
+        st.stop()   # ⛔ BLOKUJE PREDYKCJĘ
+
+    # Required fields enforcement (Twoje twarde zasady)
+    row = validated_df.iloc[0].to_dict()
+    required = required_fields_for_run(selected_name, schema)
+    missing_required = find_missing_required(row, required)
 
     # Output extraction info
     st.subheader("✅ Ekstrakcja danych")
@@ -449,37 +538,41 @@ if btn_extract or btn_predict:
         st.caption(f"LLM fallback reason: {meta['error']}")
 
     if show_debug:
-        st.code(json.dumps(features_df.iloc[0].to_dict(), indent=2, ensure_ascii=False), language="json")
+        st.code(json.dumps(row, indent=2, ensure_ascii=False), language="json")
 
-    if errors:
-        st.error("Błędy walidacji danych:")
-        for e in errors:
-            st.write("•", e)
+    # pokaż błędy walidacji
+    # if pandera_errors:
+        # st.error("Błędy walidacji (Pandera):")
+        # for e in pandera_errors:
+            # st.write("•", e)
 
-    if missing:
+    if missing_required:
         st.warning("Brakuje danych wymaganych do predykcji:")
-        st.write(", ".join(missing))
+        st.write(", ".join(missing_required))
+
+        # specjalnie doprecyzuj 5k (żeby było jasne)
+        if "Czas_5km_sek" in missing_required:
+            st.info("Czas na 5 km jest obowiązkowy i nie będzie wyliczany z 10 km — podaj go w tekście jako '5 km ...' lub '5k ...'.")
+
         st.info("Uzupełnij dane w tekście i spróbuj ponownie.")
         if btn_predict:
             st.stop()
 
     if btn_predict:
         # Predict
-        pred = predict_model(model, data=features_df)
-        y_hat = float(pred["prediction_label"].iloc[0])
+        y_hat = run_prediction(model, validated_df)
 
         st.subheader(f"🎯 Wynik – {selected_name}")
         st.metric("Szacowany czas półmaratonu", seconds_to_hhmmss(y_hat))
 
-        # Optional: show uncertainty from metadata
         mae_sec = metadata.get("metrics", {}).get("test2024_mae_sec", metadata.get("metrics", {}).get("test_mae_sec"))
         if mae_sec:
             st.caption(f"Średni błąd (MAE) na teście 2024: ±{mae_sec/60:.2f} min")
 
-        # Basic pace estimate
         pace_min_per_km = (y_hat / 60) / 21.0975
         st.write(f"Szacowane tempo: **{pace_min_per_km:.2f} min/km**")
 
         if show_debug:
-            st.subheader("Debug: predykcja")
-            st.dataframe(pred)
+            st.subheader("Debug: predykcja (tabela z PyCaret)")
+            pred_df = predict_model(model, data=validated_df)
+            st.dataframe(pred_df)
