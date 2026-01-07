@@ -20,18 +20,26 @@ try:
 except Exception:
     OpenAI = None
 
+load_dotenv()
+
+observe = None
+langfuse_client = None
+
 try:
-    # Langfuse decorator
-    from langfuse import observe
-except Exception:
-    observe = None
+    from langfuse.decorators import observe
+    from langfuse import Langfuse
+
+    langfuse_client = Langfuse()
+except Exception as e:
+    import streamlit as st
+    st.error("Langfuse import FAILED")
+    st.code(str(e))
 
 
 # -------------------------
 # App config
 # -------------------------
 st.set_page_config(page_title="Half Marathon Predictor", layout="centered")
-load_dotenv()
 
 ARTIFACTS_5K_DIR = Path("artifacts") / "pre_race_5k"
 ARTIFACTS_10K_DIR = Path("artifacts") / "pre_race_10k"
@@ -40,6 +48,14 @@ ARTIFACTS_10K_DIR = Path("artifacts") / "pre_race_10k"
 # -------------------------
 # Helpers
 # -------------------------
+
+def lf_flush_safe():
+    try:
+        langfuse_client.flush()
+    except Exception:
+        pass
+
+
 def time_to_seconds(text: str):
     """
     Parses:
@@ -561,6 +577,9 @@ if btn_extract or btn_predict:
     if btn_predict:
         # Predict
         y_hat = run_prediction(model, validated_df)
+
+        # Flush Langfuse
+        lf_flush_safe()
 
         st.subheader(f"🎯 Wynik – {selected_name}")
         st.metric("Szacowany czas półmaratonu", seconds_to_hhmmss(y_hat))
