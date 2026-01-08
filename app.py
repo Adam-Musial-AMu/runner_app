@@ -488,7 +488,6 @@ def choose_bundle_auto(extracted: dict, b5: dict, b10: dict | None):
     return b5, "PRE_RACE_5K"
 
 
-@observe(name="hm_predict") if observe is not None else (lambda f: f)
 def run_prediction(model, features_df: pd.DataFrame) -> float:
     pred = predict_model(model, data=features_df)
     return float(pred["prediction_label"].iloc[0])
