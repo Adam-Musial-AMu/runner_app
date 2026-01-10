@@ -579,127 +579,150 @@ with col2:
 
 
 if btn_extract or btn_predict:
-    if not user_text.strip():
-        st.warning("Wpisz tekst z danymi (płeć, wiek, czas 5 km).")
-        st.stop()
-
-    # --- kluczowa poprawka: ekstrakcja na superset kluczy (5k + 10k) ---
-    keys = schema_union_keys(b5["schema"], b10["schema"] if b10 else None)
-
-    # Extraction
-    if use_llm:
-        extracted, meta = llm_extract_to_dict(user_text, keys, mode_hint="pre_race_auto")
-    else:
-        extracted = regex_fallback_extract(user_text)
-        extracted = {k: extracted.get(k, None) for k in keys}
-        extracted = post_normalize_extracted(extracted, user_text)
-        meta = {"method": "regex", "ok": True, "error": None}
-
-    # --- wybór modelu ---
-    mode = st.session_state.model_mode
-    if mode == "Na podstawie czasu na 5 i 10 km (10K)":
-        if not b10:
-            st.error("Nie masz artefaktów PRE_RACE_10K. Wytrenuj model 10K albo wybierz 5K/AUTO.")
-            st.stop()
-        selected_bundle, selected_name = b10, "PRE_RACE_10K"
-
-    elif mode == "Tylko na podstawie czasu na 5 km (5K)":
-        selected_bundle, selected_name = b5, "PRE_RACE_5K"
-
-    else:
-        # AUTO (naprawione: gdy są oba czasy -> wybierz 10K)
-        selected_bundle, selected_name = choose_bundle_auto(extracted, b5, b10)
-
-    schema = selected_bundle["schema"]
-    metadata = selected_bundle["metadata"]
-    model = selected_bundle["model"]
-
-    # Build DF for chosen model schema
-    features_df = prepare_features_for_model(extracted, schema)
-
-    # Pandera validation (typy / zakresy / allowed)
-    p_schema = build_pandera_schema_from_artifact(schema)
-
     try:
-        validated_df = p_schema.validate(features_df, lazy=True)
-    except pa.errors.SchemaErrors as e:
-        st.error("Błędy walidacji danych:")
-        st.dataframe(e.failure_cases)
-        st.stop()   # ⛔ BLOKUJE PREDYKCJĘ
+        if not user_text.strip():
+            st.warning("Wpisz tekst z danymi (płeć, wiek, czas 5 km).")
+            st.stop()
 
-    # Required fields enforcement (Twoje twarde zasady)
-    row = validated_df.iloc[0].to_dict()
-    required = required_fields_for_run(selected_name, schema)
-    missing_required = find_missing_required(row, required)
+        # --- kluczowa poprawka: ekstrakcja na superset kluczy (5k + 10k) ---
+        keys = schema_union_keys(b5["schema"], b10["schema"] if b10 else None)
 
-    # Sprawdzenie spójności 5 km vs 10 km
-    if btn_predict:
-        if (
-            row.get("Czas_5km_sek") is not None
-            and row.get("Czas_10km_sek") is not None
-        ):
-            pace_5k = row["Czas_5km_sek"] / 5
-            pace_10k = row["Czas_10km_sek"] / 10
+        # Extraction
+        if use_llm:
+            extracted, meta = llm_extract_to_dict(
+                user_text,
+                keys,
+                mode_hint="pre_race_auto"
+            )
+        else:
+            extracted = regex_fallback_extract(user_text)
+            extracted = {k: extracted.get(k, None) for k in keys}
+            extracted = post_normalize_extracted(extracted, user_text)
+            meta = {"method": "regex", "ok": True, "error": None}
 
-            # różnica tempa w sekundach / km
-            delta_pace = pace_10k - pace_5k
+        # --- wybór modelu ---
+        mode = st.session_state.model_mode
 
-            if delta_pace > 20:
-                st.warning(
-                    "⚠️ **Niespójne czasy na 5 km i 10 km**\n\n"
-                    "Podany czas na 10 km jest znacznie wolniejszy względem 5 km.\n"
-                    "Model 10K może w takiej sytuacji dać wyraźnie ostrożniejszą "
-                    "prognozę półmaratonu."
+        if mode == "Na podstawie czasu na 5 i 10 km (10K)":
+            if not b10:
+                st.error(
+                    "Nie masz artefaktów PRE_RACE_10K. "
+                    "Wytrenuj model 10K albo wybierz 5K/AUTO."
+                )
+                st.stop()
+            selected_bundle, selected_name = b10, "PRE_RACE_10K"
+
+        elif mode == "Tylko na podstawie czasu na 5 km (5K)":
+            selected_bundle, selected_name = b5, "PRE_RACE_5K"
+
+        else:
+            # AUTO
+            selected_bundle, selected_name = choose_bundle_auto(extracted, b5, b10)
+
+        schema = selected_bundle["schema"]
+        metadata = selected_bundle["metadata"]
+        model = selected_bundle["model"]
+
+        # Build DF for chosen model schema
+        features_df = prepare_features_for_model(extracted, schema)
+
+        # Pandera validation
+        p_schema = build_pandera_schema_from_artifact(schema)
+        try:
+            validated_df = p_schema.validate(features_df, lazy=True)
+        except pa.errors.SchemaErrors as e:
+            st.error("Błędy walidacji danych:")
+            st.dataframe(e.failure_cases)
+            st.stop()
+
+        # Required fields enforcement
+        row = validated_df.iloc[0].to_dict()
+        required = required_fields_for_run(selected_name, schema)
+        missing_required = find_missing_required(row, required)
+
+        # Spójność 5 km vs 10 km
+        if btn_predict:
+            if (
+                row.get("Czas_5km_sek") is not None
+                and row.get("Czas_10km_sek") is not None
+            ):
+                pace_5k = row["Czas_5km_sek"] / 5
+                pace_10k = row["Czas_10km_sek"] / 10
+                delta_pace = pace_10k - pace_5k
+
+                if delta_pace > 20:
+                    st.warning(
+                        "⚠️ **Niespójne czasy na 5 km i 10 km**\n\n"
+                        "Podany czas na 10 km jest znacznie wolniejszy względem 5 km.\n"
+                        "Model 10K może dać ostrożniejszą prognozę."
+                    )
+
+        # --- UI: ekstrakcja ---
+        col3, col4 = st.columns([1, 1])
+
+        with col3:
+            st.subheader("✅ Ekstrakcja danych")
+            st.write("Metoda:", meta["method"], "| OK:", meta["ok"])
+
+            if meta.get("error"):
+                st.caption(f"LLM fallback reason: {meta['error']}")
+
+            if show_debug:
+                st.code(
+                    json.dumps(row, indent=2, ensure_ascii=False),
+                    language="json"
                 )
 
-    col3, col4 = st.columns([1, 1])
-    with col3:
-        # Output extraction info
-        st.subheader("✅ Ekstrakcja danych")
-        st.write("Metoda:", meta["method"], "| OK:", meta["ok"])
-        if meta.get("error"):
-            st.caption(f"LLM fallback reason: {meta['error']}")
+            if missing_required:
+                st.warning("Brakuje danych wymaganych do predykcji:")
+                st.write(", ".join(missing_required))
 
-        if show_debug:
-            st.code(json.dumps(row, indent=2, ensure_ascii=False), language="json")
+                if "Czas_5km_sek" in missing_required:
+                    st.info(
+                        "Czas na 5 km jest obowiązkowy i nie będzie "
+                        "wyliczany z 10 km — podaj go jawnie."
+                    )
 
-        if missing_required:
-            st.warning("Brakuje danych wymaganych do predykcji:")
-            st.write(", ".join(missing_required))
+                st.info("Uzupełnij dane w tekście i spróbuj ponownie.")
+                if btn_predict:
+                    st.stop()
 
-            # specjalnie doprecyzuj 5k (żeby było jasne)
-            if "Czas_5km_sek" in missing_required:
-                st.info("Czas na 5 km jest obowiązkowy i nie będzie wyliczany z 10 km — podaj go w tekście jako '5 km ...' lub '5k ...'.")
-
-            st.info("Uzupełnij dane w tekście i spróbuj ponownie.")
+        # --- Predykcja ---
+        with col4:
             if btn_predict:
-                st.stop()
+                y_hat = run_prediction(model, validated_df)
 
-    with col4:            
-        if btn_predict:
-            # Predict
-            y_hat = run_prediction(model, validated_df)
+                MODEL_LABELS = {
+                    "PRE_RACE_5K": "model 5K",
+                    "PRE_RACE_10K": "model 10K",
+                }
 
-            # Flush Langfuse
-            lf_flush_safe()
+                ui_model_name = MODEL_LABELS.get(selected_name, selected_name)
 
-            MODEL_LABELS = {
-                "PRE_RACE_5K": "model 5K",
-                "PRE_RACE_10K": "model 10K",
-            }
+                st.subheader(f"🎯 Wynik – {ui_model_name}")
+                st.metric(
+                    "Szacowany czas półmaratonu",
+                    seconds_to_hhmmss(y_hat)
+                )
 
-            ui_model_name = MODEL_LABELS.get(selected_name, selected_name)
+                mae_sec = metadata.get("metrics", {}).get(
+                    "test2024_mae_sec",
+                    metadata.get("metrics", {}).get("test_mae_sec"),
+                )
 
-            st.subheader(f"🎯 Wynik – {ui_model_name}")
-            st.metric("Szacowany czas półmaratonu", seconds_to_hhmmss(y_hat))
+                if mae_sec:
+                    st.caption(
+                        f"Średni błąd (MAE) na teście 2024: "
+                        f"±{mae_sec / 60:.2f} min"
+                    )
 
-            mae_sec = metadata.get("metrics", {}).get("test2024_mae_sec", metadata.get("metrics", {}).get("test_mae_sec"))
-            if mae_sec:
-                st.caption(f"Średni błąd (MAE) na teście 2024: ±{mae_sec/60:.2f} min")
+                pace_min_per_km = (y_hat / 60) / 21.0975
+                st.write(
+                    f"Szacowane tempo: **{pace_min_per_km:.2f} min/km**"
+                )
 
-            pace_min_per_km = (y_hat / 60) / 21.0975
-            st.write(f"Szacowane tempo: **{pace_min_per_km:.2f} min/km**")
+                st.markdown("### 💪 Powodzenia!")
+                st.balloons()
 
-            st.markdown("### 💪 Powodzenia!")
-            st.balloons()
-
+    finally:
+        lf_flush_safe()
