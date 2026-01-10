@@ -456,62 +456,6 @@ def find_missing_required(row: dict, required: list[str]) -> list[str]:
             missing.append(k)
     return missing
 
-
-# -------------------------
-# UI
-# -------------------------
-st.title("🏃 Predykcja czasu półmaratonu (PRE_RACE)")
-st.caption("Wpisz jednym tekstem: płeć, wiek oraz czas na 5 km (opcjonalnie 10 km). Model dobierze wariant automatycznie.")
-
-b5, b10 = get_bundles()
-
-with st.sidebar:
-    st.header("Model")
-    mode = st.selectbox(
-        "Tryb użycia",
-        ["AUTO (10k jeśli dostępne i podane)", "WYMUŚ PRE_RACE_5K", "WYMUŚ PRE_RACE_10K"],
-        index=0
-    )
-
-    st.divider()
-    st.subheader("Info o modelu (z metadata)")
-    st.write(
-        "PRE_RACE_5K MAE (test 2024):",
-        round(
-            b5["metadata"]["metrics"].get("test2024_mae_sec", b5["metadata"]["metrics"].get("test_mae_sec", 0)) / 60,
-            2
-        ),
-        "min"
-    )
-
-    if b10:
-        st.write(
-            "PRE_RACE_10K MAE (test 2024):",
-            round(b10["metadata"]["metrics"].get("test2024_mae_sec", b10["metadata"]["metrics"].get("test_mae_sec", 0)) / 60, 2),
-            "min"
-        )
-    else:
-        st.info("Brak artefaktów PRE_RACE_10K (folder artifacts/pre_race_10k).")
-
-    st.divider()
-    st.subheader("Ustawienia")
-    use_llm = st.checkbox("Użyj LLM do ekstrakcji (OpenAI)", value=True)
-    show_debug = st.checkbox("Pokaż debug (parsed JSON, walidacja)", value=True)
-
-
-user_text = st.text_area(
-    "Wejście (jedno pole tekstowe)",
-    height=140,
-    placeholder="Np. Cześć, mam 35 lat, jestem mężczyzną. 5 km robię w 24:30. 10 km w 50:10."
-)
-
-col1, col2 = st.columns([1, 1])
-with col1:
-    btn_extract = st.button("🔍 Wyciągnij dane", use_container_width=True)
-with col2:
-    btn_predict = st.button("🎯 Policz predykcję", use_container_width=True)
-
-
 def choose_bundle_auto(extracted: dict, b5: dict, b10: dict | None):
     """
     AUTO: wybierz 10K TYLKO gdy:
@@ -530,6 +474,108 @@ def choose_bundle_auto(extracted: dict, b5: dict, b10: dict | None):
 def run_prediction(model, features_df: pd.DataFrame) -> float:
     pred = predict_model(model, data=features_df)
     return float(pred["prediction_label"].iloc[0])
+
+# -------------------------
+# UI
+# -------------------------
+st.title("🏃 Predykcja czasu półmaratonu")
+
+b5, b10 = get_bundles()
+
+with st.sidebar:
+    # =========================
+    # USTAWIENIA PREDYKCJI
+    # =========================
+    st.header("⚙️ Ustawienia predykcji")
+
+    mode = st.selectbox(
+        "Sposób obliczeń",
+        [
+            "Automatyczny (najlepsze dostępne dane)",
+            "Tylko na podstawie czasu na 5 km (5K)",
+            "Na podstawie czasu na 5 i 10 km (10K)",
+        ],
+        index=0,
+        key="model_mode",
+        help=(
+            "W trybie automatycznym aplikacja sama wybierze najlepszy model "
+            "w zależności od tego, "
+            "jakie dane podasz."
+        ),
+    )
+
+    st.divider()
+
+    # =========================
+    # DOKŁADNOŚĆ MODELU
+    # =========================
+    st.subheader("📊 Dokładność modelu")
+
+    # --- 5 km ---
+    mae_5k_sec = b5["metadata"]["metrics"].get(
+        "test2024_mae_sec",
+        b5["metadata"]["metrics"].get("test_mae_sec", 0),
+    )
+
+    mae_5k_min = round(mae_5k_sec / 60, 2)
+
+    st.write("Średni błąd prognozy (model 5K):")
+    st.write(f"± {mae_5k_min} min")
+
+    # --- 10 km ---
+    if b10:
+        mae_10k_sec = b10["metadata"]["metrics"].get(
+            "test2024_mae_sec",
+            b10["metadata"]["metrics"].get("test_mae_sec", 0),
+        )
+
+        mae_10k_min = round(mae_10k_sec / 60, 2)
+
+        st.write("Średni błąd prognozy (model 10K):")
+        st.write(f"± {mae_10k_min} min")
+        st.caption("Im mniejsza wartość, tym dokładniejsza prognoza.")
+
+    else:
+        st.info(
+            "Model oparty na czasie 10 km nie jest obecnie dostępny.\n"
+            "Predykcja zostanie wykonana na podstawie czasu 5 km."
+        )
+
+    st.divider()
+
+    # =========================
+    # OPCJE DODATKOWE
+    # =========================
+    st.subheader("🔍 Opcje dodatkowe")
+
+    use_llm = st.checkbox(
+        "Wykorzystaj AI do rozpoznania danych z podanego tekstu",
+        value=True,
+        help=(
+            "Wykorzystuje model językowy OpenAI do wyciągnięcia danych z podanego tekstu."
+        ),
+    )
+
+    show_debug = st.checkbox(
+        "Pokaż informacje o uzyskanych danych",
+        value=True,
+        help="Wyświetla dane przekazane do modelu predykcyjnego.",
+    )
+
+# main    
+
+user_text = st.text_area(
+    label="Wpisz jednym tekstem: wiek, płeć oraz czas na 5 km (w celu uzyskania dokładniejszych szacunków możesz podać również czas na 10 km):",
+    height=140,
+    placeholder="Np. Cześć, mam 35 lat, jestem mężczyzną, 5 km robię w 24:30, 10 km w 50:10."
+)
+
+
+col1, col2 = st.columns([1, 1])
+with col1:
+    btn_extract = st.button("🔍 Wyciągnij dane", use_container_width=True)
+with col2:
+    btn_predict = st.button("🎯 Policz predykcję", use_container_width=True)
 
 
 if btn_extract or btn_predict:
@@ -550,13 +596,14 @@ if btn_extract or btn_predict:
         meta = {"method": "regex", "ok": True, "error": None}
 
     # --- wybór modelu ---
-    if mode == "WYMUŚ PRE_RACE_10K":
+    mode = st.session_state.model_mode
+    if mode == "Na podstawie czasu na 5 i 10 km (10K)":
         if not b10:
             st.error("Nie masz artefaktów PRE_RACE_10K. Wytrenuj model 10K albo wybierz 5K/AUTO.")
             st.stop()
         selected_bundle, selected_name = b10, "PRE_RACE_10K"
 
-    elif mode == "WYMUŚ PRE_RACE_5K":
+    elif mode == "Tylko na podstawie czasu na 5 km (5K)":
         selected_bundle, selected_name = b5, "PRE_RACE_5K"
 
     else:
@@ -585,51 +632,74 @@ if btn_extract or btn_predict:
     required = required_fields_for_run(selected_name, schema)
     missing_required = find_missing_required(row, required)
 
-    # Output extraction info
-    st.subheader("✅ Ekstrakcja danych")
-    st.write("Metoda:", meta["method"], "| OK:", meta["ok"])
-    if meta.get("error"):
-        st.caption(f"LLM fallback reason: {meta['error']}")
-
-    if show_debug:
-        st.code(json.dumps(row, indent=2, ensure_ascii=False), language="json")
-
-    # pokaż błędy walidacji
-    # if pandera_errors:
-        # st.error("Błędy walidacji (Pandera):")
-        # for e in pandera_errors:
-            # st.write("•", e)
-
-    if missing_required:
-        st.warning("Brakuje danych wymaganych do predykcji:")
-        st.write(", ".join(missing_required))
-
-        # specjalnie doprecyzuj 5k (żeby było jasne)
-        if "Czas_5km_sek" in missing_required:
-            st.info("Czas na 5 km jest obowiązkowy i nie będzie wyliczany z 10 km — podaj go w tekście jako '5 km ...' lub '5k ...'.")
-
-        st.info("Uzupełnij dane w tekście i spróbuj ponownie.")
-        if btn_predict:
-            st.stop()
-
+    # Sprawdzenie spójności 5 km vs 10 km
     if btn_predict:
-        # Predict
-        y_hat = run_prediction(model, validated_df)
+        if (
+            row.get("Czas_5km_sek") is not None
+            and row.get("Czas_10km_sek") is not None
+        ):
+            pace_5k = row["Czas_5km_sek"] / 5
+            pace_10k = row["Czas_10km_sek"] / 10
 
-        # Flush Langfuse
-        lf_flush_safe()
+            # różnica tempa w sekundach / km
+            delta_pace = pace_10k - pace_5k
 
-        st.subheader(f"🎯 Wynik – {selected_name}")
-        st.metric("Szacowany czas półmaratonu", seconds_to_hhmmss(y_hat))
+            if delta_pace > 20:
+                st.warning(
+                    "⚠️ **Niespójne czasy na 5 km i 10 km**\n\n"
+                    "Podany czas na 10 km jest znacznie wolniejszy względem 5 km.\n"
+                    "Model 10K może w takiej sytuacji dać wyraźnie ostrożniejszą "
+                    "prognozę półmaratonu."
+                )
 
-        mae_sec = metadata.get("metrics", {}).get("test2024_mae_sec", metadata.get("metrics", {}).get("test_mae_sec"))
-        if mae_sec:
-            st.caption(f"Średni błąd (MAE) na teście 2024: ±{mae_sec/60:.2f} min")
-
-        pace_min_per_km = (y_hat / 60) / 21.0975
-        st.write(f"Szacowane tempo: **{pace_min_per_km:.2f} min/km**")
+    col3, col4 = st.columns([1, 1])
+    with col3:
+        # Output extraction info
+        st.subheader("✅ Ekstrakcja danych")
+        st.write("Metoda:", meta["method"], "| OK:", meta["ok"])
+        if meta.get("error"):
+            st.caption(f"LLM fallback reason: {meta['error']}")
 
         if show_debug:
-            st.subheader("Debug: predykcja (tabela z PyCaret)")
-            pred_df = predict_model(model, data=validated_df)
-            st.dataframe(pred_df)
+            st.code(json.dumps(row, indent=2, ensure_ascii=False), language="json")
+
+        if missing_required:
+            st.warning("Brakuje danych wymaganych do predykcji:")
+            st.write(", ".join(missing_required))
+
+            # specjalnie doprecyzuj 5k (żeby było jasne)
+            if "Czas_5km_sek" in missing_required:
+                st.info("Czas na 5 km jest obowiązkowy i nie będzie wyliczany z 10 km — podaj go w tekście jako '5 km ...' lub '5k ...'.")
+
+            st.info("Uzupełnij dane w tekście i spróbuj ponownie.")
+            if btn_predict:
+                st.stop()
+
+    with col4:            
+        if btn_predict:
+            # Predict
+            y_hat = run_prediction(model, validated_df)
+
+            # Flush Langfuse
+            lf_flush_safe()
+
+            MODEL_LABELS = {
+                "PRE_RACE_5K": "model 5K",
+                "PRE_RACE_10K": "model 10K",
+            }
+
+            ui_model_name = MODEL_LABELS.get(selected_name, selected_name)
+
+            st.subheader(f"🎯 Wynik – {ui_model_name}")
+            st.metric("Szacowany czas półmaratonu", seconds_to_hhmmss(y_hat))
+
+            mae_sec = metadata.get("metrics", {}).get("test2024_mae_sec", metadata.get("metrics", {}).get("test_mae_sec"))
+            if mae_sec:
+                st.caption(f"Średni błąd (MAE) na teście 2024: ±{mae_sec/60:.2f} min")
+
+            pace_min_per_km = (y_hat / 60) / 21.0975
+            st.write(f"Szacowane tempo: **{pace_min_per_km:.2f} min/km**")
+
+            st.markdown("### 💪 Powodzenia!")
+            st.balloons()
+
