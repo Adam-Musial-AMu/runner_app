@@ -44,6 +44,15 @@ st.set_page_config(page_title="Half Marathon Predictor", layout="centered")
 ARTIFACTS_5K_DIR = Path("artifacts") / "pre_race_5k"
 ARTIFACTS_10K_DIR = Path("artifacts") / "pre_race_10k"
 
+# global reset handler
+AUTO_MODE_LABEL = "Automatyczny (najlepsze dostępne dane)"
+
+if st.session_state.get("btn_reset"):
+    st.session_state["user_text"] = ""
+    st.session_state["model_mode"] = AUTO_MODE_LABEL
+    st.session_state.pop("btn_reset", None)
+    st.rerun()
+
 
 # -------------------------
 # Helpers
@@ -567,7 +576,8 @@ with st.sidebar:
 user_text = st.text_area(
     label="Wpisz jednym tekstem: wiek, płeć oraz czas na 5 km (w celu uzyskania dokładniejszych szacunków możesz podać również czas na 10 km):",
     height=140,
-    placeholder="Np. Cześć, mam 35 lat, jestem mężczyzną, 5 km robię w 24:30, 10 km w 50:10."
+    placeholder="Np. Cześć, mam 35 lat, jestem mężczyzną, 5 km robię w 24:30, 10 km w 50:10.",
+    key="user_text",
 )
 
 
@@ -726,3 +736,9 @@ if btn_extract or btn_predict:
 
     finally:
         lf_flush_safe()
+
+btn_reset = st.button(
+    "🔄 Reset – zacznij od nowa",
+    use_container_width=True,
+    key="btn_reset",
+)
