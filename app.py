@@ -686,8 +686,11 @@ if btn_extract or btn_predict:
                 st.caption(f"LLM fallback reason: {meta['error']}")
 
             if show_debug:
+                row_for_display = row.copy()
+                row_for_display.pop("Rok", None)
+
                 st.code(
-                    json.dumps(row, indent=2, ensure_ascii=False),
+                    json.dumps(row_for_display, indent=2, ensure_ascii=False),
                     language="json"
                 )
 
