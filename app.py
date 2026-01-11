@@ -460,26 +460,26 @@ def build_pandera_schema_from_artifact(schema_json: dict) -> pa.DataFrameSchema:
     return DataFrameSchema(columns, coerce=True, strict=False)
 
 
-def required_fields_for_run(selected_name: str, schema: dict):
-    """
-    Rule:
-        - always required: Age, Gender, Time_5km_sec
-        - for the 10K model, we additionally require Time_10km_sec (if we are running it)
-    """
-    req = ["Wiek", "Płeć", "Czas_5km_sek"]
-    if selected_name == "PRE_RACE_10K":
-        # if the schema has 10k, then we require it
-        if "Czas_10km_sek" in schema.get("features", {}):
-            req.append("Czas_10km_sek")
-    return req
+# def required_fields_for_run(selected_name: str, schema: dict):
+#     """
+#     Rule:
+#         - always required: Age, Gender, Time_5km_sec
+#         - for the 10K model, we additionally require Time_10km_sec (if we are running it)
+#     """
+#     req = ["Wiek", "Płeć", "Czas_5km_sek"]
+#     if selected_name == "PRE_RACE_10K":
+#         # if the schema has 10k, then we require it
+#         if "Czas_10km_sek" in schema.get("features", {}):
+#             req.append("Czas_10km_sek")
+#     return req
 
 
-def find_missing_required(row: dict, required: list[str]) -> list[str]:
-    missing = []
-    for k in required:
-        if k not in row or row[k] is None or row[k] == "":
-            missing.append(k)
-    return missing
+# def find_missing_required(row: dict, required: list[str]) -> list[str]:
+#     missing = []
+#     for k in required:
+#         if k not in row or row[k] is None or row[k] == "":
+#             missing.append(k)
+#     return missing
 
 def choose_bundle_auto(extracted: dict, b5: dict, b10: dict | None):
     """
@@ -499,6 +499,59 @@ def choose_bundle_auto(extracted: dict, b5: dict, b10: dict | None):
 def run_prediction(model, features_df: pd.DataFrame) -> float:
     pred = predict_model(model, data=features_df)
     return float(pred["prediction_label"].iloc[0])
+
+def pandera_errors_to_user_messages(
+    failure_cases: pd.DataFrame,
+    schema: dict
+) -> list[str]:
+    messages = []
+
+    for _, row in failure_cases.iterrows():
+        field = row["column"]
+        check = str(row["check"])
+        value = row.get("failure_case")
+
+        rules = schema["features"].get(field, {})
+
+        # --- Płeć ---
+        if field == "Płeć":
+            messages.append(
+                "❌ **Płeć**: wpisz „M” (mężczyzna) lub „K” (kobieta)."
+            )
+
+        # --- Wiek ---
+        elif field == "Wiek":
+            min_v = rules.get("min")
+            max_v = rules.get("max")
+            messages.append(
+                f"❌ **Wiek**: podaj liczbę w zakresie **{min_v}–{max_v} lat**."
+            )
+
+        # --- Czas 5 km ---
+        elif field == "Czas_5km_sek":
+            min_v = rules.get("min")
+            max_v = rules.get("max")
+            messages.append(
+                "❌ **Czas na 5 km**: wpisz realny czas biegu, np. **5 km biegnę w** "
+                "**24:30**, **00:24:30** lub **1470 sekund** "
+                f"(zakres: {min_v//60}–{max_v//60} min)."
+            )
+
+        # --- Rok ---
+        elif field == "Rok":
+            allowed = rules.get("allowed", [])
+            messages.append(
+                f"❌ **Rok**: dozwolone wartości to: {', '.join(map(str, allowed))}."
+            )
+
+        else:
+            messages.append(
+                f"❌ **{field}**: nieprawidłowa wartość ({value})."
+            )
+
+    # usuń duplikaty
+    return list(dict.fromkeys(messages))
+
 
 # -------------------------
 # UI
@@ -619,6 +672,13 @@ if btn_extract or btn_predict:
             extracted = post_normalize_extracted(extracted, user_text)
             meta = {"method": "regex", "ok": True, "error": None}
 
+        if btn_predict and extracted.get("Płeć") is None:
+            st.error(
+                "❌ Nie rozpoznano płci. "
+                "Podaj „M” (mężczyzna) lub „K” (kobieta)."
+            )
+            st.stop()
+
         mode = st.session_state.model_mode
 
         if mode == "Na podstawie czasu na 5 i 10 km (10K)":
@@ -649,14 +709,25 @@ if btn_extract or btn_predict:
         try:
             validated_df = p_schema.validate(features_df, lazy=True)
         except pa.errors.SchemaErrors as e:
-            st.error("Błędy walidacji danych:")
-            st.dataframe(e.failure_cases)
+            st.error("⚠️ Niektóre dane są nieprawidłowe. Sprawdź poniżej co poprawić:")
+
+            user_messages = pandera_errors_to_user_messages(
+                e.failure_cases,
+                schema
+            )
+
+            for msg in user_messages:
+                st.markdown(msg)
+
+            with st.expander("🔍 Szczegóły techniczne (debug)"):
+                st.dataframe(e.failure_cases)
+
             st.stop()
 
         # Required fields enforcement
         row = validated_df.iloc[0].to_dict()
-        required = required_fields_for_run(selected_name, schema)
-        missing_required = find_missing_required(row, required)
+        # required = required_fields_for_run(selected_name, schema)
+        # missing_required = find_missing_required(row, required)
 
         # Consistency 5 km vs. 10 km
         if btn_predict:
@@ -694,19 +765,19 @@ if btn_extract or btn_predict:
                     language="json"
                 )
 
-            if missing_required:
-                st.warning("Brakuje danych wymaganych do predykcji:")
-                st.write(", ".join(missing_required))
+            # if missing_required:
+            #     st.warning("Brakuje danych wymaganych do predykcji:")
+            #     st.write(", ".join(missing_required))
 
-                if "Czas_5km_sek" in missing_required:
-                    st.info(
-                        "Czas na 5 km jest obowiązkowy i nie będzie "
-                        "wyliczany z 10 km — podaj go jawnie."
-                    )
+            #     if "Czas_5km_sek" in missing_required:
+            #         st.info(
+            #             "Czas na 5 km jest obowiązkowy i nie będzie "
+            #             "wyliczany z 10 km — podaj go jawnie."
+            #         )
 
-                st.info("Uzupełnij dane w tekście i spróbuj ponownie.")
-                if btn_predict:
-                    st.stop()
+            #     st.info("Uzupełnij dane w tekście i spróbuj ponownie.")
+            #     if btn_predict:
+            #         st.stop()
 
         # Prediction
         with col4:
