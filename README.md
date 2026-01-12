@@ -1,110 +1,153 @@
 # 🏃 Half-Marathon Time Predictor
 
-Aplikacja do szacowania czasu ukończenia półmaratonu na podstawie danych dostępnych
-**przed startem biegu** (pre-race).
+Aplikacja do **szacowania czasu ukończenia półmaratonu** na podstawie danych dostępnych  
+**przed startem biegu** (*pre-race inference*).
 
-Projekt obejmuje pełny pipeline:
-- czyszczenie i przygotowanie danych,
-- trenowanie i walidację modeli,
-- wersjonowanie artefaktów,
-- aplikację inferencyjną w Streamlit,
-- ekstrakcję danych wejściowych z tekstu użytkownika przy użyciu LLM,
-- monitoring jakości ekstrakcji (Langfuse).
+Projekt obejmuje **pełny, produkcyjny pipeline ML**:
+- przygotowanie i walidację danych,
+- trenowanie i wersjonowanie modeli,
+- inferencję w aplikacji Streamlit,
+- ekstrakcję danych wejściowych z tekstu użytkownika (LLM),
+- monitoring jakości ekstrakcji (Langfuse),
+- wdrożenie na **DigitalOcean App Platform**,
+- niezależne wersjonowanie modeli w **DigitalOcean Spaces**.
 
 ---
 
 ## 🎯 Cel projektu
 
-Celem projektu jest realistyczna estymacja czasu ukończenia półmaratonu
-w oparciu o minimalny zestaw informacji, który zawodnik może podać przed startem biegu.
+Celem projektu jest **realistyczna estymacja czasu półmaratonu** w oparciu o **minimalny zestaw informacji**, który zawodnik może znać **przed startem biegu**.
 
-Projekt **świadomie unika data leakage** – wykorzystywane są wyłącznie cechy,
-które są znane przed rozpoczęciem zawodów.
+Projekt **świadomie unika data leakage**:
+- nie używa danych z biegu docelowego,
+- nie korzysta z informacji dostępnych dopiero po starcie,
+- wykorzystuje wyłącznie cechy znane *pre-race*.
 
 ---
 
 ## 🧠 Wytrenowane modele
 
-W ramach projektu wytrenowano dwa komplementarne modele predykcyjne.
+W projekcie zastosowano **dwa komplementarne modele predykcyjne**.
 
 ### PRE_RACE_5K
-Model bazowy, wykorzystywany gdy dostępne są tylko podstawowe dane:
+Model bazowy, używany gdy dostępne są tylko podstawowe dane:
 - płeć,
 - wiek,
-- czas uzyskany na dystansie 5 km.
+- czas uzyskany na dystansie **5 km**.
 
-Model ten:
+Cechy modelu:
 - działa przy minimalnych wymaganiach wejściowych,
 - zapewnia stabilną predykcję,
-- osiąga średni błąd bezwzględny (MAE) ok. **5 minut** na danych testowych z roku 2024.
+- osiąga średni błąd bezwzględny (MAE) ≈ **5 minut**  
+  na danych testowych z roku 2024.
 
 ---
 
 ### PRE_RACE_10K
-Model rozszerzony, używany gdy użytkownik poda dodatkowo czas na dystansie 10 km:
+Model rozszerzony, wykorzystywany gdy użytkownik poda dodatkowo czas na **10 km**:
 - płeć,
 - wiek,
 - czas na 5 km,
 - czas na 10 km.
 
-Dodatkowa informacja o dłuższym dystansie pozwala:
-- lepiej odwzorować tempo zawodnika,
-- zmniejszyć błąd predykcji względem wariantu 5 km.
+Zalety:
+- lepsze odwzorowanie tempa zawodnika,
+- niższy błąd predykcji względem wariantu 5 km.
 
-Aplikacja automatycznie wybiera ten model, jeśli dane wejściowe są dostępne.
+Aplikacja **automatycznie wybiera** ten model, jeśli dane wejściowe są dostępne.
 
 ---
 
 ## 📊 Walidacja i interpretowalność
 
 - Modele walidowane są **czasowo**:
-  - trening na danych z 2023 roku,
-  - test na danych z 2024 roku.
-- Zapewnia to realistyczną ocenę generalizacji w przyszłych edycjach biegu.
+  - trening: dane z 2023 roku,
+  - test: dane z 2024 roku.
+- Zapewnia to realistyczną ocenę generalizacji na przyszłe edycje biegu.
 - Analiza istotności cech potwierdza, że:
-  - dominującą rolę odgrywają czasy na 5 km i 10 km,
-  - wiek pełni rolę korekcyjną,
-  - płeć i rok mają marginalny wpływ.
+  - kluczową rolę odgrywają czasy na 5 km i 10 km,
+  - wiek działa jako korekta,
+  - płeć i rok mają wpływ marginalny.
 
-Takie zachowanie modeli jest zgodne z wiedzą dziedzinową.
+Zachowanie modeli jest zgodne z wiedzą dziedzinową.
 
 ---
 
 ## 📦 Artefakty modelu
 
-Każdy model posiada komplet artefaktów:
+Każdy model posiada kompletny zestaw artefaktów:
 
 - **model `.pkl`** – wytrenowany model predykcyjny,
-- **`schema.json`** – kontrakt danych wejściowych (typy, zakresy, wymagane pola),
-- **`metadata.json`** – metryki jakości, zakresy danych treningowych, kontekst,
-- **`latest.json`** – wskazanie aktualnej wersji modelu używanej przez aplikację.
+- **`schema.json`** – kontrakt danych wejściowych (typy, zakresy, dozwolone wartości),
+- **`metadata.json`** – metryki jakości i kontekst treningu,
+- **`latest.json`** – wskaźnik aktualnej wersji modelu używanej przez aplikację.
 
-Dzięki temu:
-- modele mogą być aktualizowane bez zmiany kodu aplikacji,
-- możliwy jest łatwy rollback lub A/B testing.
+Artefakty są przechowywane w **DigitalOcean Spaces**, co umożliwia:
+- aktualizację modeli **bez redeployu aplikacji**,
+- rollback do wcześniejszej wersji,
+- przyszłe A/B testy.
 
 ---
 
 ## 🧩 Aplikacja Streamlit
 
 Aplikacja Streamlit:
-- przyjmuje **jedno pole tekstowe** jako wejście,
-- wykorzystuje model językowy (OpenAI) do ekstrakcji danych do postaci JSON,
-- waliduje dane zgodnie z `schema.json`,
-- informuje użytkownika o brakujących danych,
-- automatycznie dobiera właściwy model (5K / 10K),
-- prezentuje wynik wraz z informacją o średnim błędzie modelu.
 
-W przypadku braku dostępu do LLM stosowany jest fallback oparty o wyrażenia regularne.
+- przyjmuje **jedno pole tekstowe** jako wejście,
+- wykorzystuje **LLM (OpenAI)** do ekstrakcji danych do postaci JSON,
+- posiada **regex fallback**, gdy LLM jest niedostępny,
+- stosuje **anti-hallucination guards** (brak wzmianki o dystansie → brak wartości),
+- waliduje dane wejściowe przy użyciu **Pandera + `schema.json`**,
+- automatycznie dobiera model (5K / 10K),
+- prezentuje wynik wraz z:
+  - przewidywanym czasem,
+  - tempem min/km,
+  - informacją o średnim błędzie modelu (MAE).
 
 ---
 
 ## 🔍 Monitoring LLM (Langfuse)
 
-Ekstrakcja danych wejściowych przez LLM jest logowana do Langfuse, co umożliwia:
-- analizę poprawności ekstrakcji,
-- monitoring błędów,
-- iteracyjne doskonalenie promptów.
+Ekstrakcja danych wejściowych przez LLM jest monitorowana przy użyciu **Langfuse**:
+- logowanie trace’ów,
+- analiza błędów ekstrakcji,
+- iteracyjne doskonalenie promptów,
+- kontrola kosztów i latencji.
+
+---
+
+## ☁️ Architektura wdrożeniowa
+
+- **Kod aplikacji**: GitHub → DigitalOcean App Platform
+- **Modele i artefakty**: DigitalOcean Spaces
+- **Deploy aplikacji**: automatyczny po pushu do GitHub
+- **Aktualizacja modeli**: upload do Spaces (bez deployu)
+
+---
+
+## 🔄 Flow aplikacji (czytelny diagram)
+
+```mermaid
+flowchart TD
+    A[Użytkownik wpisuje tekst] --> B[Ekstrakcja danych]
+    B -->|LLM| C[OpenAI]
+    B -->|Fallback| D[Regex]
+    C --> E[Post-normalizacja]
+    D --> E
+
+    E --> F[Anti-hallucination guard]
+    F --> G[Wybór modelu]
+    G -->|AUTO| H{Dostępny 10 km?}
+    H -->|TAK| I[Model PRE_RACE_10K]
+    H -->|NIE| J[Model PRE_RACE_5K]
+
+    I --> K[Budowa DataFrame]
+    J --> K
+    K --> L[Pandera validation]
+    L -->|OK| M[Predykcja PyCaret]
+    L -->|Błąd| N[Komunikat UI]
+
+    M --> O[Wynik + tempo + MAE]
 
 ---
 
@@ -114,68 +157,22 @@ Ekstrakcja danych wejściowych przez LLM jest logowana do Langfuse, co umożliwi
 - **PyCaret 3.3.2**
 - **scikit-learn**
 - **Streamlit**
-- **OpenAI SDK**
+- **OpenAI SDK (1.x)**
 - **Langfuse**
-- **pandas / numpy / matplotlib**
+- **Pandera**
+- **pandas / numpy / scipy**
+- **DigitalOcean App Platform**
+- **DigitalOcean Spaces**
 
 ---
 
 ## 🚀 Uruchomienie lokalne
 
+```bash
 pip install -r requirements.txt
 streamlit run app.py
 
-## App flow
-
-┌──────────────┐
-│  Streamlit   │
-│  start app   │
-└──────┬───────┘
-       │
-       ▼
-┌────────────────────┐
-│ User wpisuje tekst │
-└──────┬─────────────┘
-       │ klik
-       ▼
-┌──────────────────────────┐
-│ Ekstrakcja danych        │
-│ - LLM (@observe)         │
-│ - regex fallback         │
-└──────┬───────────────────┘
-       │
-       ▼
-┌──────────────────────────┐
-│ Anti-hallucination guard │
-│ - brak 5km → None        │
-│ - brak 10km → None       │
-└──────┬───────────────────┘
-       │
-       ▼
-┌──────────────────────────┐
-│ Wybór modelu             │
-│ AUTO / 5K / 10K          │
-└──────┬───────────────────┘
-       │
-       ▼
-┌──────────────────────────┐
-│ Build DataFrame (1 row)  │
-└──────┬───────────────────┘
-       │
-       ▼
-┌──────────────────────────┐
-│ Pandera VALIDATION       │
-│ (schema.json)            │
-└───┬───────────────┬──────┘
-    │ OK            │ ERROR
-    ▼               ▼
-┌────────────┐   ┌──────────────┐
-│ Predict    │   │ UI error     │
-│ PyCaret    │   │ st.stop()    │
-└────┬───────┘   └──────────────┘
-     │
-     ▼
-┌──────────────────────────┐
-│ Wynik + tempo + MAE      │
-└──────────────────────────┘
+> **Uwaga:**  
+> Aplikacja korzysta z modeli przechowywanych w **DigitalOcean Spaces**.  
+> Do uruchomienia lokalnego wymagane są odpowiednie zmienne środowiskowe (`SPACES_*`).
 
