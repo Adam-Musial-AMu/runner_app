@@ -4,6 +4,10 @@ import os
 from pathlib import Path
 from datetime import timedelta
 
+import boto3
+from botocore.exceptions import ClientError
+
+
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -41,9 +45,6 @@ except Exception as e:
 # -------------------------
 st.set_page_config(page_title="Half Marathon Predictor", layout="centered")
 
-ARTIFACTS_5K_DIR = Path("artifacts") / "pre_race_5k"
-ARTIFACTS_10K_DIR = Path("artifacts") / "pre_race_10k"
-
 # global reset handler
 AUTO_MODE_LABEL = "Automatyczny (najlepsze dostępne dane)"
 
@@ -53,10 +54,101 @@ if st.session_state.get("btn_reset"):
     st.session_state.pop("btn_reset", None)
     st.rerun()
 
+# =========================
+# DigitalOcean Spaces config
+# =========================
+SPACES_BUCKET = os.getenv("SPACES_BUCKET", "amu")
+SPACES_ENDPOINT = os.getenv("SPACES_ENDPOINT")
+SPACES_KEY = os.getenv("SPACES_KEY")
+SPACES_SECRET = os.getenv("SPACES_SECRET")
+
+CACHE_DIR = Path("/tmp/hm_artifacts")
+
+if not all([SPACES_ENDPOINT, SPACES_KEY, SPACES_SECRET]):
+    st.error(
+        "❌ Brak konfiguracji DigitalOcean Spaces "
+        "(SPACES_ENDPOINT / SPACES_KEY / SPACES_SECRET)"
+    )
+    st.stop()
+
 
 # -------------------------
 # Helpers
 # -------------------------
+
+def get_s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=SPACES_ENDPOINT,
+        aws_access_key_id=SPACES_KEY,
+        aws_secret_access_key=SPACES_SECRET,
+    )
+
+
+def load_latest_bundle(model_subdir: str):
+    """
+    Pobiera artefakty z DO Spaces:
+      s3://amu/artifacts/<model_subdir>/
+    i zapisuje lokalnie do:
+      /tmp/hm_artifacts/<model_subdir>/
+    """
+    s3 = get_s3_client()
+
+    remote_prefix = f"artifacts/{model_subdir}"
+    local_dir = CACHE_DIR / model_subdir
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- latest.json ---
+    latest_path = local_dir / "latest.json"
+
+    try:
+        s3.download_file(
+            SPACES_BUCKET,
+            f"{remote_prefix}/latest.json",
+            str(latest_path),
+        )
+    except ClientError as e:
+        raise RuntimeError(
+            f"Brak latest.json w s3://{SPACES_BUCKET}/{remote_prefix}"
+        ) from e
+
+
+    latest = json.loads(latest_path.read_text(encoding="utf-8"))
+
+    # --- pozostałe pliki ---
+    model_pkl = local_dir / latest["model_pkl"]
+    meta_json = local_dir / latest["metadata_json"]
+    schema_json = local_dir / latest["schema_json"]
+
+    for remote_name, local_path in [
+        (latest["model_pkl"], model_pkl),
+        (latest["metadata_json"], meta_json),
+        (latest["schema_json"], schema_json),
+    ]:
+        s3.download_file(
+            SPACES_BUCKET,
+            f"{remote_prefix}/{remote_name}",
+            str(local_path),
+        )
+
+    schema = json.loads(schema_json.read_text(encoding="utf-8"))
+    metadata = json.loads(meta_json.read_text(encoding="utf-8"))
+
+    # PyCaret: ścieżka BEZ .pkl
+    model_stem = str(model_pkl.with_suffix(""))
+    model = load_model(model_stem)
+
+    return {
+        "latest": latest,
+        "schema": schema,
+        "metadata": metadata,
+        "model": model,
+        "artifact_dir": local_dir,
+        "model_pkl": str(model_pkl),
+        "meta_json": str(meta_json),
+        "schema_json": str(schema_json),
+    }
+
 
 def lf_flush_safe():
     try:
@@ -133,50 +225,15 @@ def normalize_sex(s: str):
     return None
 
 
-def load_latest_bundle(artifact_dir: Path):
-    latest_path = artifact_dir / "latest.json"
-    if not latest_path.exists():
-        raise FileNotFoundError(f"Missing latest.json: {latest_path}")
-
-    latest = json.loads(latest_path.read_text(encoding="utf-8"))
-
-    model_pkl = artifact_dir / latest["model_pkl"]
-    meta_json = artifact_dir / latest["metadata_json"]
-    schema_json = artifact_dir / latest["schema_json"]
-
-    if not model_pkl.exists():
-        raise FileNotFoundError(f"Missing model file: {model_pkl}")
-    if not meta_json.exists():
-        raise FileNotFoundError(f"Missing metadata file: {meta_json}")
-    if not schema_json.exists():
-        raise FileNotFoundError(f"Missing schema file: {schema_json}")
-
-    schema = json.loads(schema_json.read_text(encoding="utf-8"))
-    metadata = json.loads(meta_json.read_text(encoding="utf-8"))
-
-    # PyCaret load_model expects path WITHOUT ".pkl"
-    model_stem = str(model_pkl.with_suffix(""))
-    model = load_model(model_stem)
-
-    return {
-        "latest": latest,
-        "schema": schema,
-        "metadata": metadata,
-        "model": model,
-        "artifact_dir": artifact_dir,
-        "model_pkl": str(model_pkl),
-        "meta_json": str(meta_json),
-        "schema_json": str(schema_json),
-    }
-
-
-@st.cache_resource
+@st.cache_resource(ttl=300)
 def get_bundles():
-    b5 = load_latest_bundle(ARTIFACTS_5K_DIR)
-    b10 = None
-    if (ARTIFACTS_10K_DIR / "latest.json").exists():
-        b10 = load_latest_bundle(ARTIFACTS_10K_DIR)
+    b5 = load_latest_bundle("pre_race_5k")
+    try:
+        b10 = load_latest_bundle("pre_race_10k")
+    except Exception:
+        b10 = None
     return b5, b10
+
 
 
 def get_default_year_from_schema(schema: dict):
