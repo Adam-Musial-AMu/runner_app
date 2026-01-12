@@ -686,7 +686,7 @@ col1, col2 = st.columns([1, 1])
 with col1:
     btn_extract = st.button("🔍 Wyciągnij dane", use_container_width=True)
 with col2:
-    btn_predict = st.button("🎯 Policz predykcję", use_container_width=True)
+    btn_predict = st.button("🎯 Policz prognozowany czas", use_container_width=True)
 
 
 if btn_extract or btn_predict:
